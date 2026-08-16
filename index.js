@@ -1,5 +1,5 @@
 /**
- * SillyTavern-PresetHistory TauriTest v2.2.1
+ * SillyTavern-PresetHistory TauriTest v2.2.2
  *
  * 预设版本历史扩展 —— 自动 + 手动备份预设，一键回退
  * 拦截设置/预设保存请求，提取预设数据，按名字保存快照。
@@ -7,7 +7,8 @@
  * by Elvis & 小九
  */
 
-import { extension_settings, getContext } from '../../../extensions.js';
+import { extension_settings } from '../../../extensions.js';
+import * as OpenAI from '../../../openai.js';
 import { saveSettingsDebounced } from '../../../../script.js';
 
 // 测试版使用独立设置空间，不会读写正式版的历史快照。
@@ -68,6 +69,35 @@ function deepClone(obj) {
     catch (e) { return JSON.parse(JSON.stringify(obj)); }
 }
 
+function stableStringify(value) {
+    function normalize(input) {
+        if (Array.isArray(input)) {
+            return input.map(normalize);
+        }
+        if (input && typeof input === 'object') {
+            var sorted = {};
+            var keys = Object.keys(input).sort();
+            for (var i = 0; i < keys.length; i++) {
+                if (input[keys[i]] !== undefined) sorted[keys[i]] = normalize(input[keys[i]]);
+            }
+            return sorted;
+        }
+        return input;
+    }
+    return JSON.stringify(normalize(value));
+}
+
+function getPresetHash(data) {
+    try {
+        var normalized = deepClone(data || {});
+        // 预设名不属于预设内容，切换或改名时不应产生伪差异。
+        if (normalized && typeof normalized === 'object') delete normalized.preset_settings_openai;
+        return hash(stableStringify(normalized));
+    } catch (e) {
+        return '';
+    }
+}
+
 function getCurrentPresetName() {
     var presetSelectors = ['#settings_perset_openai', '#settings_preset_openai', 'select[name="preset_openai"]'];
     for (var i = 0; i < presetSelectors.length; i++) {
@@ -77,6 +107,9 @@ function getCurrentPresetName() {
             if (selectedText) return selectedText;
         }
     }
+    if (OpenAI.oai_settings && typeof OpenAI.oai_settings.preset_settings_openai === 'string') {
+        return OpenAI.oai_settings.preset_settings_openai.trim();
+    }
     return '';
 }
 
@@ -84,6 +117,58 @@ function getCurrentPresetName() {
 
 // 缓存最后一次拦截到的完整请求体（给手动备份用）
 var lastInterceptedBody = null;
+
+/**
+ * 直接从酒馆当前的 Chat Completion 设置构建预设。
+ * TauriTavern 的原生网络层不一定经过扩展改写后的 window.fetch，
+ * 所以直接读取是主路径，请求拦截只作为旧版兼容兜底。
+ */
+function getLivePresetInfo() {
+    try {
+        var presetData = null;
+
+        if (typeof OpenAI.getChatCompletionPreset === 'function') {
+            presetData = OpenAI.getChatCompletionPreset();
+        } else if (OpenAI.oai_settings && OpenAI.settingsToUpdate) {
+            presetData = {};
+            var entries = Object.entries(OpenAI.settingsToUpdate);
+            for (var i = 0; i < entries.length; i++) {
+                var presetKey = entries[i][0];
+                var settingsKey = entries[i][1][1];
+                presetData[presetKey] = OpenAI.oai_settings[settingsKey];
+            }
+            presetData = deepClone(presetData);
+        }
+
+        if (!presetData || typeof presetData !== 'object' || Object.keys(presetData).length === 0) return null;
+
+        return {
+            name: getCurrentPresetName() || '当前预设',
+            data: presetData,
+        };
+    } catch (e) {
+        console.warn('[PresetHistory] 读取当前预设失败:', e);
+        return null;
+    }
+}
+
+function rememberPresetInfo(info) {
+    if (!info) return;
+    lastInterceptedBody = {
+        apiId: 'openai',
+        name: info.name,
+        preset: deepClone(info.data),
+    };
+}
+
+function getBestCurrentPresetInfo() {
+    var liveInfo = getLivePresetInfo();
+    if (liveInfo) {
+        rememberPresetInfo(liveInfo);
+        return liveInfo;
+    }
+    return lastInterceptedBody ? extractPresetInfo(lastInterceptedBody) : null;
+}
 
 /**
  * 从 settings save 的请求体里找到预设名和预设数据。
@@ -173,30 +258,10 @@ function extractPresetInfo(body) {
 // ========== 快照核心 ==========
 
 function saveSnapshot(presetName, data, source, customLabel) {
-    // 用白名单提取用户关心的字段来做hash，排除每次保存都可能变的元数据
-    var hashFields = [
-        'prompts', 'prompt_order',
-        'temp_openai', 'top_p_openai', 'top_k_openai', 'min_p_openai', 'top_a_openai',
-        'freq_pen_openai', 'pres_pen_openai', 'repetition_penalty_openai',
-        'openai_max_context', 'openai_max_tokens', 'stream_openai',
-        'main_prompt', 'jailbreak_prompt', 'nsfw_prompt',
-        'impersonation_prompt', 'new_chat_prompt', 'new_group_chat_prompt',
-        'send_if_empty', 'wrap_in_quotes',
-        'chat_completion_source', 'openai_model', 'claude_model',
-    ];
-    var coreData = {};
-    for (var fi = 0; fi < hashFields.length; fi++) {
-        if (data[hashFields[fi]] !== undefined) coreData[hashFields[fi]] = data[hashFields[fi]];
-    }
-
-    var coreStr;
-    try { coreStr = JSON.stringify(coreData); } catch (e) { return null; }
-    var h = hash(coreStr);
-
-    // 如果白名单全空，用完整数据
-    if (Object.keys(coreData).length === 0) {
-        try { h = hash(JSON.stringify(data)); } catch (e) { return null; }
-    }
+    // 新版预设字段会持续增加，完整计算内容哈希，避免白名单漏掉 temperature 等字段。
+    // 键名排序后再序列化，防止对象键顺序不同造成假变化。
+    var h = getPresetHash(data);
+    if (!h) return null;
 
     var settings = getSettings();
     var key = presetName;
@@ -206,7 +271,7 @@ function saveSnapshot(presetName, data, source, customLabel) {
         if (existing.length === 0) {
             // 没备份过 → 存第一份作为基线
             console.log('[PresetHistory] 首次备份: ' + presetName);
-        } else if (existing[0].hash === h) {
+        } else if (existing[0].hash === h || getPresetHash(existing[0].data) === h) {
             // 有备份，内容一样 → 跳过
             return null;
         } else if (restoredToHash && restoredToHash === h) {
@@ -297,6 +362,7 @@ var fetchPatched = false;
 var originalFetch = null;
 var isRestoring = false;
 var restoredToHash = ''; // 刚恢复到的版本的hash，用于跳过恢复后的重复备份
+var directCaptureInstalled = false;
 
 function isPresetSaveRequest(url, method) {
     if (method !== 'POST') return false;
@@ -331,12 +397,11 @@ async function readJsonRequestBody(input, init) {
     return null;
 }
 
-function handlePresetSaveBody(parsed) {
-    var info = extractPresetInfo(parsed);
+function handlePresetInfo(info) {
     if (!info) return;
 
     // 即使关闭自动备份也缓存最新预设，保证“立即备份”仍然可用。
-    lastInterceptedBody = parsed;
+    rememberPresetInfo(info);
 
     var settings = getSettings();
     if (!settings.autoSnapshot) return;
@@ -357,6 +422,10 @@ function handlePresetSaveBody(parsed) {
         console.log('[PresetHistory] 自动备份: ' + info.name);
         setTimeout(renderSnapshotList, 0);
     }
+}
+
+function handlePresetSaveBody(parsed) {
+    handlePresetInfo(extractPresetInfo(parsed));
 }
 
 async function capturePresetSaveRequest(input, init) {
@@ -393,6 +462,23 @@ function installFetchInterceptor() {
     console.log('[PresetHistory] 拦截器已安装');
 }
 
+function installDirectPresetCapture() {
+    if (directCaptureInstalled) return;
+
+    // TauriTavern 可能让请求直接进入原生网络层，因此在“保存当前预设”按钮处
+    // 再读取一次酒馆内存中的真实预设。普通 SillyTavern 同样兼容。
+    jQuery(document).on('click.presetHistoryCapture', '#update_oai_preset', function () {
+        if (isRestoring) return;
+        setTimeout(function () {
+            var info = getLivePresetInfo();
+            if (info) handlePresetInfo(info);
+        }, 0);
+    });
+
+    directCaptureInstalled = true;
+    console.log('[PresetHistory] 当前预设直读捕获已安装');
+}
+
 // ========== 对比 ==========
 
 /**
@@ -402,6 +488,8 @@ function installFetchInterceptor() {
  */
 function diffPresets(oldData, newData, mode) {
     if (!mode) mode = 'restore';
+    oldData = oldData || {};
+    newData = newData || {};
     var diffs = [];
 
     var oldPrompts = (oldData && oldData.prompts) || [];
@@ -537,18 +625,78 @@ function diffPresets(oldData, newData, mode) {
         }
     }
 
-    // 参数变化
-    var settingFields = ['temp_openai', 'top_p_openai', 'freq_pen_openai', 'pres_pen_openai',
-        'openai_max_context', 'openai_max_tokens', 'min_p_openai', 'top_k_openai'];
+    // 参数变化：同时兼容旧版内部字段名和新版预设导出字段名。
+    var settingFields = [
+        { keys: ['temperature', 'temp_openai'], label: '温度' },
+        { keys: ['top_p', 'top_p_openai'], label: 'Top P' },
+        { keys: ['top_k', 'top_k_openai'], label: 'Top K' },
+        { keys: ['min_p', 'min_p_openai'], label: 'Min P' },
+        { keys: ['top_a', 'top_a_openai'], label: 'Top A' },
+        { keys: ['frequency_penalty', 'freq_pen_openai'], label: '频率惩罚' },
+        { keys: ['presence_penalty', 'pres_pen_openai'], label: '存在惩罚' },
+        { keys: ['repetition_penalty', 'repetition_penalty_openai'], label: '重复惩罚' },
+        { keys: ['openai_max_context'], label: '上下文长度' },
+        { keys: ['openai_max_tokens'], label: '最大回复长度' },
+    ];
+
+    function readSetting(data, keys) {
+        for (var ri = 0; ri < keys.length; ri++) {
+            if (data[keys[ri]] !== undefined) return data[keys[ri]];
+        }
+        return undefined;
+    }
+
     var settingChanges = [];
     for (var sf = 0; sf < settingFields.length; sf++) {
-        var field = settingFields[sf];
-        if (oldData[field] !== undefined && newData[field] !== undefined && oldData[field] !== newData[field]) {
-            settingChanges.push(field.replace(/_openai$/, '').replace(/_/g, ' '));
+        var oldValue = readSetting(oldData, settingFields[sf].keys);
+        var newValue = readSetting(newData, settingFields[sf].keys);
+        if (oldValue !== undefined && newValue !== undefined && stableStringify(oldValue) !== stableStringify(newValue)) {
+            settingChanges.push(settingFields[sf].label);
         }
     }
     if (settingChanges.length > 0) {
-        diffs.push('参数变化: ' + settingChanges.join(', '));
+        diffs.push('参数变化：' + settingChanges.join('、'));
+    }
+
+    // 其余预设字段也参与提示，避免新版增加字段后只备份却说不出改了什么。
+    var ignoredKeys = { prompts: true, prompt_order: true, preset_settings_openai: true };
+    for (var ig = 0; ig < settingFields.length; ig++) {
+        for (var ik = 0; ik < settingFields[ig].keys.length; ik++) ignoredKeys[settingFields[ig].keys[ik]] = true;
+    }
+    var friendlyNames = {
+        stream_openai: '流式输出',
+        chat_completion_source: '接口来源',
+        openai_model: 'OpenAI 模型',
+        claude_model: 'Claude 模型',
+        openrouter_model: 'OpenRouter 模型',
+        google_model: 'Google 模型',
+        custom_model: '自定义模型',
+        custom_url: '自定义接口地址',
+        names_behavior: '名称行为',
+        send_if_empty: '空消息内容',
+        impersonation_prompt: '角色扮演提示词',
+        new_chat_prompt: '新聊天提示词',
+        new_group_chat_prompt: '新群聊提示词',
+        continue_nudge_prompt: '继续生成提示词',
+        custom_prompt_post_processing: '提示词后处理',
+        reasoning_effort: '推理强度',
+        verbosity: '详细程度',
+        seed: 'Seed',
+    };
+    var allOtherKeys = {};
+    Object.keys(oldData).forEach(function (key) { allOtherKeys[key] = true; });
+    Object.keys(newData).forEach(function (key) { allOtherKeys[key] = true; });
+    var otherChanges = [];
+    Object.keys(allOtherKeys).sort().forEach(function (key) {
+        if (ignoredKeys[key]) return;
+        if (stableStringify(oldData[key]) !== stableStringify(newData[key])) {
+            otherChanges.push(friendlyNames[key] || key.replace(/_/g, ' '));
+        }
+    });
+    if (otherChanges.length > 0) {
+        var shownChanges = otherChanges.slice(0, 4);
+        var moreText = otherChanges.length > shownChanges.length ? '等' + otherChanges.length + '项' : '';
+        diffs.push('设置变化：' + shownChanges.join('、') + moreText);
     }
 
     if (diffs.length === 0) {
@@ -584,11 +732,9 @@ function getCsrfToken() {
 async function restoreSnapshot(presetName, snap) {
     try {
         // 先备份当前的
-        if (lastInterceptedBody) {
-            var currentInfo = extractPresetInfo(lastInterceptedBody);
-            if (currentInfo) {
-                saveSnapshot(currentInfo.name, currentInfo.data, 'manual', '已恢复至版本：' + snap.label);
-            }
+        var currentInfo = getBestCurrentPresetInfo();
+        if (currentInfo) {
+            saveSnapshot(currentInfo.name, currentInfo.data, 'manual', '恢复前备份：' + snap.label);
         }
 
         var bodyToSend = deepClone(snap.data);
@@ -610,7 +756,7 @@ async function restoreSnapshot(presetName, snap) {
         $fileInput[0].files = dataTransfer.files;
 
         // 记录恢复目标的hash，恢复后的自动保存如果匹配就跳过
-        restoredToHash = snap.hash || '';
+        restoredToHash = getPresetHash(snap.data) || snap.hash || '';
 
         // 触发change事件，让ST的导入逻辑接管
         $fileInput[0].dispatchEvent(new Event('input', { bubbles: true }));
@@ -951,12 +1097,10 @@ function renderSnapshotList() {
             $item.find('.ph-restore').on('click', async function () {
                 // 对比当前和备份的差异
                 var diffText = '';
-                if (lastInterceptedBody) {
-                    var currentInfo = extractPresetInfo(lastInterceptedBody);
-                    if (currentInfo) {
-                        var diffs = diffPresets(currentInfo.data, snap.data, 'restore');
-                        diffText = '\n\n【当前 vs 备份的区别】\n' + diffs.join('\n');
-                    }
+                var currentInfo = getBestCurrentPresetInfo();
+                if (currentInfo) {
+                    var diffs = diffPresets(currentInfo.data, snap.data, 'restore');
+                    diffText = '\n\n【当前 vs 备份的区别】\n' + diffs.join('\n');
                 }
                 if (!confirm('要把「' + name + '」恢复到这个版本吗？\n' + snap.label + '\n' + fmtTime(snap.ts) + diffText + '\n\n当前预设会被覆盖，页面会自动刷新。')) return;
                 await restoreSnapshot(name, snap);
@@ -993,17 +1137,26 @@ function renderSnapshotList() {
 }
 
 function manualSnapshotNow() {
-    if (!lastInterceptedBody) {
-        toastr.warning('还没有拦截到数据。请先随便改一下预设并保存，让扩展捕获一次数据。');
-        return;
-    }
     var customLabel = jQuery('#ph_manual_label').val().trim();
-    var info = extractPresetInfo(lastInterceptedBody);
+    var info = getBestCurrentPresetInfo();
     if (!info) {
-        toastr.error('无法从缓存数据中提取预设信息。');
+        toastr.error('无法读取当前预设，请切换一次预设后重试。');
         return;
     }
-    var snap = saveSnapshot(info.name, info.data, 'manual', customLabel || '手动备份');
+
+    var snapshotLabel = customLabel;
+    if (!snapshotLabel) {
+        var existingSnaps = getSnapshots(info.name);
+        if (existingSnaps.length > 0) {
+            var diffs = diffPresets(existingSnaps[0].data, info.data, 'changelog');
+            var realDiffs = diffs.filter(function (d) { return d !== '没有检测到差异'; });
+            snapshotLabel = realDiffs.length > 0 ? realDiffs.slice(0, 3).join('；') : '手动备份（无变化）';
+        } else {
+            snapshotLabel = '首次手动备份';
+        }
+    }
+
+    var snap = saveSnapshot(info.name, info.data, 'manual', snapshotLabel);
     if (snap) {
         toastr.success('已备份：' + info.name);
     } else {
@@ -1035,6 +1188,7 @@ jQuery(async function () {
     addUI();
     // 始终拦截以便缓存手动备份数据；开关只控制是否自动生成快照。
     installFetchInterceptor();
-    console.log('[PresetHistory Test] v2.2.1 已加载');
-    toastr.success('预设历史测试版 v2.2.1 已加载', '🧪');
+    installDirectPresetCapture();
+    console.log('[PresetHistory Test] v2.2.2 已加载');
+    toastr.success('预设历史测试版 v2.2.2 已加载', '🧪');
 });
