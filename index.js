@@ -1,5 +1,5 @@
 /**
- * SillyTavern-PresetHistory v2.2.1
+ * SillyTavern-PresetHistory TauriTest v2.2.1
  *
  * 预设版本历史扩展 —— 自动 + 手动备份预设，一键回退
  * 拦截设置/预设保存请求，提取预设数据，按名字保存快照。
@@ -10,7 +10,8 @@
 import { extension_settings, getContext } from '../../../extensions.js';
 import { saveSettingsDebounced } from '../../../../script.js';
 
-const EXT_NAME = 'preset-history';
+// 测试版使用独立设置空间，不会读写正式版的历史快照。
+const EXT_NAME = 'preset-history-tauri-test';
 const PRESET_SAVE_ENDPOINTS = ['/api/settings/save', '/api/presets/save'];
 
 const DEFAULTS = {
@@ -717,7 +718,7 @@ function addUI() {
     var html = '<div id="ph_settings">'
         + '<div class="inline-drawer">'
         + '<div class="inline-drawer-toggle inline-drawer-header">'
-        + '<b>📸 预设历史版本</b>'
+        + '<b>🧪 预设历史测试版</b>'
         + '<div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>'
         + '</div>'
         + '<div class="inline-drawer-content">'
@@ -1034,6 +1035,6 @@ jQuery(async function () {
     addUI();
     // 始终拦截以便缓存手动备份数据；开关只控制是否自动生成快照。
     installFetchInterceptor();
-    console.log('[PresetHistory] v2.2.1 已加载');
-    toastr.success('预设历史版本 v2.2.1 已加载', '📸');
+    console.log('[PresetHistory Test] v2.2.1 已加载');
+    toastr.success('预设历史测试版 v2.2.1 已加载', '🧪');
 });

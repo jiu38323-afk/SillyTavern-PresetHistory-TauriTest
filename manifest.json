@@ -1,5 +1,5 @@
 {
-    "display_name": "Preset History (预设历史版本)",
+    "display_name": "Preset History Tauri Test (预设历史测试版)",
     "loading_order": 100,
     "requires": [],
     "optional": [],
@@ -8,6 +8,6 @@
     "css": "",
     "author": "Elvis & 小九",
     "version": "2.2.1",
-    "homePage": "https://github.com/jiu38323-afk/SillyTavern-PresetHistory",
+    "homePage": "https://github.com/jiu38323-afk/-SillyTavern-PresetHistory-TauriTest",
     "auto_update": true
 }
