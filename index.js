@@ -1,8 +1,8 @@
 /**
- * SillyTavern-PresetHistory TauriTest v2.2.3
+ * SillyTavern-PresetHistory TauriTest v2.2.5
  *
  * 预设版本历史扩展 —— 自动 + 手动备份预设，一键回退
- * 拦截设置/预设保存请求，提取预设数据，按名字保存快照。
+ * 监听当前预设状态与保存事件，按真实预设名保存快照。
  *
  * by Elvis & 小九
  */
@@ -388,6 +388,9 @@ var isRestoring = false;
 var restoredToHash = ''; // 刚恢复到的版本的hash，用于跳过恢复后的重复备份
 var directCaptureInstalled = false;
 var presetSwitchCaptureInstalled = false;
+var settingsUpdatedCaptureInstalled = false;
+var settingsUpdatedCaptureTimer = null;
+var lastObservedPresetHashes = {};
 
 function isPresetSaveRequest(url, method) {
     if (method !== 'POST') return false;
@@ -537,6 +540,40 @@ function installPresetSwitchCapture() {
     console.log('[PresetHistory] 预设切换捕获已安装');
 }
 
+function installSettingsUpdatedCapture() {
+    if (settingsUpdatedCaptureInstalled || !eventSource || !event_types || !event_types.SETTINGS_UPDATED) return;
+
+    // PromptManager 的开关、解绑、删除、导入、重置、快速编辑最终都会走这里。
+    // 这是不依赖具体按钮类名的总兜底，也能覆盖未来新增的预设字段。
+    eventSource.on(event_types.SETTINGS_UPDATED, function () {
+        if (isRestoring) return;
+        if (settingsUpdatedCaptureTimer) clearTimeout(settingsUpdatedCaptureTimer);
+        settingsUpdatedCaptureTimer = setTimeout(function () {
+            var info = getLivePresetInfo();
+            if (!info) return;
+
+            var currentHash = getPresetHash(info.data);
+            var previousHash = lastObservedPresetHashes[info.name];
+            var contentChanged = !previousHash || previousHash !== currentHash;
+            lastObservedPresetHashes[info.name] = currentHash;
+
+            handlePresetInfo(info);
+            if (contentChanged && getSettings().autoSavePreset) triggerPresetSave();
+        }, 0);
+    });
+
+    // 先记住当前状态，后面的 SETTINGS_UPDATED 才能排除只改主题等无关设置的情况。
+    setTimeout(function () {
+        var info = getLivePresetInfo();
+        if (!info) return;
+        lastObservedPresetHashes[info.name] = getPresetHash(info.data);
+        rememberPresetInfo(info);
+    }, 0);
+
+    settingsUpdatedCaptureInstalled = true;
+    console.log('[PresetHistory] 设置更新总捕获已安装');
+}
+
 // ========== 对比 ==========
 
 /**
@@ -572,14 +609,28 @@ function diffPresets(oldData, newData, mode) {
 
     var oldPO = (oldData && oldData.prompt_order) || [];
     var newPO = (newData && newData.prompt_order) || [];
-    if (oldPO.length > 0 && oldPO[0] && oldPO[0].order) {
-        oldOrder = oldPO[0].order;
+
+    function getRelevantPromptOrder(promptOrders) {
+        var activeCharacter = OpenAI.promptManager && OpenAI.promptManager.activeCharacter;
+        var activeId = activeCharacter && activeCharacter.id !== undefined ? String(activeCharacter.id) : '';
+        if (activeId) {
+            for (var poi = 0; poi < promptOrders.length; poi++) {
+                if (promptOrders[poi] && String(promptOrders[poi].character_id) === activeId && Array.isArray(promptOrders[poi].order)) {
+                    return promptOrders[poi].order;
+                }
+            }
+        }
+        return promptOrders.length > 0 && promptOrders[0] && Array.isArray(promptOrders[0].order) ? promptOrders[0].order : [];
+    }
+
+    oldOrder = getRelevantPromptOrder(oldPO);
+    newOrder = getRelevantPromptOrder(newPO);
+    if (oldOrder.length > 0) {
         for (var oi = 0; oi < oldOrder.length; oi++) {
             oldEnabledMap[oldOrder[oi].identifier] = !!oldOrder[oi].enabled;
         }
     }
-    if (newPO.length > 0 && newPO[0] && newPO[0].order) {
-        newOrder = newPO[0].order;
+    if (newOrder.length > 0) {
         for (var ni = 0; ni < newOrder.length; ni++) {
             newEnabledMap[newOrder[ni].identifier] = !!newOrder[ni].enabled;
         }
@@ -595,7 +646,7 @@ function diffPresets(oldData, newData, mode) {
     // 新增的条目：区分"创建"和"绑定"
     // prompts里新增但order里没有 = 创建了条目（还没绑定）
     for (var pk in newContentMap) {
-        if (!oldContentMap[pk] && !newEnabledMap[pk]) {
+        if (!oldContentMap[pk] && newEnabledMap[pk] === undefined) {
             if (mode === 'changelog') {
                 diffs.push('创建了条目「' + getName(pk) + '」');
             } else {
@@ -653,7 +704,7 @@ function diffPresets(oldData, newData, mode) {
         }
     }
 
-    // 内容修改（比较prompts数组里的content和name）
+    // 条目属性修改
     for (var mk in oldContentMap) {
         if (newContentMap[mk]) {
             var op = oldContentMap[mk];
@@ -661,6 +712,25 @@ function diffPresets(oldData, newData, mode) {
             var changes = [];
             if ((op.content || '') !== (np.content || '')) changes.push('内容');
             if ((op.name || '') !== (np.name || '')) changes.push('名称');
+            var promptFields = [
+                { key: 'role', label: '角色' },
+                { key: 'injection_position', label: '注入位置' },
+                { key: 'injection_depth', label: '注入深度' },
+                { key: 'injection_order', label: '注入顺序' },
+                { key: 'injection_trigger', label: '触发条件' },
+                { key: 'forbid_overrides', label: '覆盖规则' },
+                { key: 'system_prompt', label: '系统标记' },
+                { key: 'marker', label: '标记类型' },
+                { key: 'attach_role', label: '附加角色' },
+                { key: 'attach_index', label: '附加楼层' },
+                { key: 'attach_side', label: '附加位置' },
+            ];
+            for (var pf = 0; pf < promptFields.length; pf++) {
+                var promptField = promptFields[pf];
+                if (stableStringify(op[promptField.key]) !== stableStringify(np[promptField.key])) {
+                    changes.push(promptField.label);
+                }
+            }
             if (changes.length > 0) {
                 if (mode === 'changelog') {
                     diffs.push('修改了「' + (np.name || '未命名') + '」' + changes.join('、'));
@@ -843,10 +913,10 @@ function applyLocks() {
             + '.ph-locked-params #range_block_openai::after { content: "🔒 参数已锁定"; position: absolute; top: 4px; right: 8px; font-size: 12px; opacity: 0.8; }'
             + '.ph-locked-prompts #completion_prompt_manager { pointer-events: none; opacity: 0.5; position: relative; }'
             + '.ph-locked-prompts #completion_prompt_manager::after { content: "🔒 条目已锁定"; position: absolute; top: 4px; right: 8px; font-size: 12px; opacity: 0.8; }'
-            + '.ph-locked-prompts .completion_prompt_manager_popup { pointer-events: none; opacity: 0.5; }'
-            + '.ph-locked-prompts .prompt-manager-prompt-controls { pointer-events: none; }'
-            + '.ph-locked-prompts .prompt_manager_prompt_toggle { pointer-events: none; }'
-            + '.ph-locked-prompts .ui-sortable-handle { cursor: default !important; }'
+            + '.ph-locked-prompts #completion_prompt_manager_popup { pointer-events: none; opacity: 0.5; }'
+            + '.ph-locked-prompts .prompt_manager_prompt_controls { pointer-events: none; }'
+            + '.ph-locked-prompts .prompt-manager-toggle-action { pointer-events: none; }'
+            + '.ph-locked-prompts .ui-sortable-handle, .ph-locked-prompts .drag-handle { cursor: default !important; }'
             ;
         document.head.appendChild(style);
         lockStyleAdded = true;
@@ -871,6 +941,7 @@ function applyLocks() {
 
 var autoSaveInstalled = false;
 var autoSaveTimer = null;
+var promptToggleCaptureInstalled = false;
 
 function triggerPresetSave() {
     // 防抖2秒，避免连续操作触发多次保存
@@ -890,6 +961,30 @@ function triggerPresetSave() {
     }, 2000);
 }
 
+function installPromptToggleCapture() {
+    if (promptToggleCaptureInstalled) return;
+
+    // 新版 PromptManager 点击后会立刻重绘整个条目，普通的冒泡委托可能错过目标。
+    // 在捕获阶段先认出开关，再等当前点击处理结束后读取已经更新的预设状态。
+    document.addEventListener('click', function (event) {
+        var target = event.target;
+        if (!target || typeof target.closest !== 'function') return;
+        var toggle = target.closest('.prompt-manager-toggle-action, .prompt_manager_prompt_toggle, .prompt-toggle, [data-pm-toggle]');
+        if (!toggle) return;
+
+        setTimeout(function () {
+            if (!isRestoring) {
+                var info = getLivePresetInfo();
+                if (info) handlePresetInfo(info);
+            }
+            triggerPresetSave();
+        }, 0);
+    }, true);
+
+    promptToggleCaptureInstalled = true;
+    console.log('[PresetHistory] 条目开关捕获已安装');
+}
+
 function installAutoSave() {
     if (autoSaveInstalled) return;
 
@@ -901,19 +996,33 @@ function installAutoSave() {
         '#temp_openai', '#top_p_openai', '#top_k_openai', '#min_p_openai', '#top_a_openai',
         '#freq_pen_openai', '#pres_pen_openai', '#repetition_penalty_openai',
         '#openai_max_context', '#openai_max_tokens', '#seed_openai',
-        '#stream_toggle', '#names_behavior', '#reasoning_effort', '#openai_reasoning_effort', '#openai_verbosity'
+        '#stream_toggle', '#names_behavior', '#openai_reasoning_effort', '#openai_verbosity'
     ];
+
+    // 同步酒馆当前导出的全部预设控件，后续新增模型/参数字段时无需再手写选择器。
+    if (OpenAI.settingsToUpdate) {
+        Object.keys(OpenAI.settingsToUpdate).forEach(function (key) {
+            var definition = OpenAI.settingsToUpdate[key];
+            var selector = definition && definition[0];
+            if (typeof selector === 'string' && selector && selector !== '#NULL_SELECTOR') {
+                paramSelectors.push(selector);
+            }
+        });
+    }
+    paramSelectors = paramSelectors.filter(function (selector, index, array) {
+        return array.indexOf(selector) === index;
+    });
     jQuery(document).on('input.presetHistory change.presetHistory', paramSelectors.join(','), function (event, eventData) {
         // 酒馆在加载另一个预设时也会批量触发 input；这些不是用户修改，交给切换监听处理。
         if (eventData && eventData.source === 'preset') return;
         triggerPresetSave();
     });
 
-    // 3. 条目开关变化
-    jQuery(document).on('click.presetHistory', '.prompt_manager_prompt_toggle, .prompt-toggle, [data-pm-toggle]', triggerPresetSave);
+    // 3. 条目开关变化（使用捕获阶段，兼容新版点击后立即重绘的 PromptManager）
+    installPromptToggleCapture();
 
     // 4. 条目拖拽排序完成
-    jQuery(document).on('sortupdate.presetHistory', triggerPresetSave);
+    jQuery(document).on('sortupdate.presetHistory sortstop.presetHistory', '#completion_prompt_manager_list', triggerPresetSave);
 
     autoSaveInstalled = true;
     console.log('[PresetHistory] 自动保存已安装');
@@ -1246,6 +1355,8 @@ jQuery(async function () {
     installFetchInterceptor();
     installDirectPresetCapture();
     installPresetSwitchCapture();
-    console.log('[PresetHistory Test] v2.2.3 已加载');
-    toastr.success('预设历史测试版 v2.2.3 已加载', '🧪');
+    installSettingsUpdatedCapture();
+    installPromptToggleCapture();
+    console.log('[PresetHistory Test] v2.2.5 已加载');
+    toastr.success('预设历史测试版 v2.2.5 已加载', '🧪');
 });
