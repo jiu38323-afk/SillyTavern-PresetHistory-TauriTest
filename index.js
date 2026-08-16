@@ -1,5 +1,5 @@
 /**
- * SillyTavern-PresetHistory TauriTest v2.2.2
+ * SillyTavern-PresetHistory TauriTest v2.2.3
  *
  * 预设版本历史扩展 —— 自动 + 手动备份预设，一键回退
  * 拦截设置/预设保存请求，提取预设数据，按名字保存快照。
@@ -9,7 +9,7 @@
 
 import { extension_settings } from '../../../extensions.js';
 import * as OpenAI from '../../../openai.js';
-import { saveSettingsDebounced } from '../../../../script.js';
+import { eventSource, event_types, saveSettingsDebounced } from '../../../../script.js';
 
 // 测试版使用独立设置空间，不会读写正式版的历史快照。
 const EXT_NAME = 'preset-history-tauri-test';
@@ -98,17 +98,32 @@ function getPresetHash(data) {
     }
 }
 
-function getCurrentPresetName() {
-    var presetSelectors = ['#settings_perset_openai', '#settings_preset_openai', 'select[name="preset_openai"]'];
+function getCurrentPresetSelect() {
+    // 正确拼写优先；旧插件把历史拼写 settings_perset 放在前面，
+    // TauriTavern 同时保留多个节点时会读到隐藏的旧值。
+    var presetSelectors = ['#settings_preset_openai', '#settings_perset_openai', 'select[name="preset_openai"]'];
+    var $fallback = null;
     for (var i = 0; i < presetSelectors.length; i++) {
-        var $ps = jQuery(presetSelectors[i]);
-        if ($ps.length) {
-            var selectedText = $ps.find('option:selected').text().trim();
-            if (selectedText) return selectedText;
-        }
+        var $matches = jQuery(presetSelectors[i]);
+        if (!$matches.length) continue;
+        var $visible = $matches.filter(':visible').first();
+        if ($visible.length) return $visible;
+        if (!$fallback) $fallback = $matches.first();
     }
+    return $fallback || jQuery();
+}
+
+function getCurrentPresetName() {
+    // 内存状态是当前真正生效的预设，优先于可能隐藏或滞后的 DOM 下拉框。
     if (OpenAI.oai_settings && typeof OpenAI.oai_settings.preset_settings_openai === 'string') {
-        return OpenAI.oai_settings.preset_settings_openai.trim();
+        var settingsName = OpenAI.oai_settings.preset_settings_openai.trim();
+        if (settingsName) return settingsName;
+    }
+
+    var $ps = getCurrentPresetSelect();
+    if ($ps.length) {
+        var selectedText = $ps.find('option:selected').text().trim();
+        if (selectedText) return selectedText;
     }
     return '';
 }
@@ -123,22 +138,31 @@ var lastInterceptedBody = null;
  * TauriTavern 的原生网络层不一定经过扩展改写后的 window.fetch，
  * 所以直接读取是主路径，请求拦截只作为旧版兼容兜底。
  */
+function buildPresetData(settings) {
+    var sourceSettings = settings || OpenAI.oai_settings;
+    if (!sourceSettings) return null;
+
+    if (typeof OpenAI.getChatCompletionPreset === 'function') {
+        return OpenAI.getChatCompletionPreset(sourceSettings);
+    }
+
+    if (OpenAI.settingsToUpdate) {
+        var presetData = {};
+        var entries = Object.entries(OpenAI.settingsToUpdate);
+        for (var i = 0; i < entries.length; i++) {
+            var presetKey = entries[i][0];
+            var settingsKey = entries[i][1][1];
+            presetData[presetKey] = sourceSettings[settingsKey];
+        }
+        return deepClone(presetData);
+    }
+
+    return null;
+}
+
 function getLivePresetInfo() {
     try {
-        var presetData = null;
-
-        if (typeof OpenAI.getChatCompletionPreset === 'function') {
-            presetData = OpenAI.getChatCompletionPreset();
-        } else if (OpenAI.oai_settings && OpenAI.settingsToUpdate) {
-            presetData = {};
-            var entries = Object.entries(OpenAI.settingsToUpdate);
-            for (var i = 0; i < entries.length; i++) {
-                var presetKey = entries[i][0];
-                var settingsKey = entries[i][1][1];
-                presetData[presetKey] = OpenAI.oai_settings[settingsKey];
-            }
-            presetData = deepClone(presetData);
-        }
+        var presetData = buildPresetData(OpenAI.oai_settings);
 
         if (!presetData || typeof presetData !== 'object' || Object.keys(presetData).length === 0) return null;
 
@@ -363,6 +387,7 @@ var originalFetch = null;
 var isRestoring = false;
 var restoredToHash = ''; // 刚恢复到的版本的hash，用于跳过恢复后的重复备份
 var directCaptureInstalled = false;
+var presetSwitchCaptureInstalled = false;
 
 function isPresetSaveRequest(url, method) {
     if (method !== 'POST') return false;
@@ -477,6 +502,39 @@ function installDirectPresetCapture() {
 
     directCaptureInstalled = true;
     console.log('[PresetHistory] 当前预设直读捕获已安装');
+}
+
+function installPresetSwitchCapture() {
+    if (presetSwitchCaptureInstalled || !eventSource || !event_types) return;
+
+    // 切走之前先保存旧预设。此时事件里的 settings 仍是旧预设内容，
+    // presetNameBefore 则是它的真实名字，不会发生“新名字 + 旧内容”的串档。
+    if (event_types.OAI_PRESET_CHANGED_BEFORE) {
+        eventSource.on(event_types.OAI_PRESET_CHANGED_BEFORE, function (event) {
+            if (isRestoring || !event) return;
+            var oldName = typeof event.presetNameBefore === 'string' ? event.presetNameBefore.trim() : '';
+            var oldData = buildPresetData(event.settings);
+            if (oldName && oldData) handlePresetInfo({ name: oldName, data: oldData });
+        });
+    }
+
+    // 新预设完全应用后再建立它的基线，并把历史列表跟到当前预设。
+    if (event_types.PRESET_CHANGED) {
+        eventSource.on(event_types.PRESET_CHANGED, function (event) {
+            if (isRestoring || !event || event.apiId !== 'openai') return;
+            setTimeout(function () {
+                var info = getLivePresetInfo();
+                if (!info) return;
+                if (typeof event.name === 'string' && event.name.trim()) info.name = event.name.trim();
+                handlePresetInfo(info);
+                jQuery('#ph_filter_name').val('');
+                renderSnapshotList();
+            }, 0);
+        });
+    }
+
+    presetSwitchCaptureInstalled = true;
+    console.log('[PresetHistory] 预设切换捕获已安装');
 }
 
 // ========== 对比 ==========
@@ -836,17 +894,20 @@ function installAutoSave() {
     if (autoSaveInstalled) return;
 
     // 1. 条目保存按钮：保存条目后自动保存预设
-    jQuery('#completion_prompt_manager_popup_entry_form_save').on('click.presetHistory', triggerPresetSave);
+    jQuery(document).on('click.presetHistory', '#completion_prompt_manager_popup_entry_form_save', triggerPresetSave);
 
-    // 2. 参数滑块/输入框变化：温度、top_p等
+    // 2. 参数滑块/输入框变化：iOS 拖动滑块主要触发 input，不一定触发 change。
     var paramSelectors = [
-        '#temp_openai', '#top_p_openai', '#top_k_openai', '#min_p_openai',
+        '#temp_openai', '#top_p_openai', '#top_k_openai', '#min_p_openai', '#top_a_openai',
         '#freq_pen_openai', '#pres_pen_openai', '#repetition_penalty_openai',
-        '#openai_max_context', '#openai_max_tokens'
+        '#openai_max_context', '#openai_max_tokens', '#seed_openai',
+        '#stream_toggle', '#names_behavior', '#reasoning_effort', '#openai_reasoning_effort', '#openai_verbosity'
     ];
-    for (var i = 0; i < paramSelectors.length; i++) {
-        jQuery(paramSelectors[i]).on('change.presetHistory', triggerPresetSave);
-    }
+    jQuery(document).on('input.presetHistory change.presetHistory', paramSelectors.join(','), function (event, eventData) {
+        // 酒馆在加载另一个预设时也会批量触发 input；这些不是用户修改，交给切换监听处理。
+        if (eventData && eventData.source === 'preset') return;
+        triggerPresetSave();
+    });
 
     // 3. 条目开关变化
     jQuery(document).on('click.presetHistory', '.prompt_manager_prompt_toggle, .prompt-toggle, [data-pm-toggle]', triggerPresetSave);
@@ -895,7 +956,8 @@ function addUI() {
 
         + '<hr style="margin:8px 0" />'
 
-        + '<div style="margin:6px 0"><label style="display:block;margin-bottom:4px;font-weight:600">选择预设</label>'
+        + '<div style="margin:6px 0"><label style="display:block;margin-bottom:4px;font-weight:600">查看备份记录</label>'
+        + '<small style="display:block;opacity:0.65;margin-bottom:5px">当前酒馆预设：<b id="ph_current_preset_name">读取中…</b><br/>下面只筛选历史记录，不会切换酒馆预设。</small>'
         + '<select id="ph_filter_name" style="width:100%;box-sizing:border-box"></select></div>'
 
         + '<div id="ph_snapshot_list" style="max-height:400px;overflow-y:auto;border:1px solid rgba(128,128,128,0.3);border-radius:6px;padding:4px;margin-top:6px">'
@@ -959,18 +1021,15 @@ function addUI() {
     jQuery('#ph_manual_now').on('click', manualSnapshotNow);
     jQuery('#ph_filter_name').on('change', renderSnapshotList);
 
-    // 监听ST的预设下拉菜单变化，自动跟着切换
-    var presetSelectors = ['#settings_perset_openai', '#settings_preset_openai'];
-    for (var pi = 0; pi < presetSelectors.length; pi++) {
-        var $ps = jQuery(presetSelectors[pi]);
-        if ($ps.length) {
-            $ps.on('change', function () {
-                // 重置选择，让renderNameFilter自动选中新的当前预设
+    // DOM 变化作为旧版酒馆的 UI 同步兜底；实际快照由预设事件监听负责。
+    var $currentPresetSelect = getCurrentPresetSelect();
+    if ($currentPresetSelect.length) {
+        $currentPresetSelect.on('change.presetHistoryFilter', function () {
+            setTimeout(function () {
                 jQuery('#ph_filter_name').val('');
                 renderSnapshotList();
-            });
-            break;
-        }
+            }, 50);
+        });
     }
 
     renderSnapshotList();
@@ -981,22 +1040,18 @@ function renderNameFilter() {
     var cur = $sel.val();
     $sel.empty();
 
-    // 从ST页面上的预设下拉菜单读取所有预设名字 + 当前选中的预设
+    // 从酒馆当前内存状态读取真实生效的预设名；DOM 只用于枚举全部名字。
     var allPresets = [];
-    var currentSTPreset = '';
-    var presetSelectors = ['#settings_perset_openai', '#settings_preset_openai', 'select[name="preset_openai"]'];
-    for (var si = 0; si < presetSelectors.length; si++) {
-        var $stSelect = jQuery(presetSelectors[si]);
-        if ($stSelect.length) {
-            currentSTPreset = $stSelect.find('option:selected').text().trim();
-            $stSelect.find('option').each(function () {
-                var val = jQuery(this).val();
-                var text = jQuery(this).text().trim();
-                if (val && text) allPresets.push(text);
-            });
-            break;
-        }
+    var currentSTPreset = getCurrentPresetName();
+    var $stSelect = getCurrentPresetSelect();
+    if ($stSelect.length) {
+        $stSelect.find('option').each(function () {
+            var val = jQuery(this).val();
+            var text = jQuery(this).text().trim();
+            if (val && text) allPresets.push(text);
+        });
     }
+    jQuery('#ph_current_preset_name').text(currentSTPreset || '未读取到');
 
     // 获取有备份的预设
     var backedUp = getAllPresetNames();
@@ -1039,19 +1094,18 @@ function renderNameFilter() {
     }
 
     for (var j = 0; j < options.length; j++) {
-        var displayName = escapeHTML(options[j].name);
         var prefix = options[j].current ? '▶ ' : '';
         var suffix = options[j].count > 0 ? ' — ' + options[j].count + ' 个备份' : ' — 未备份';
-        $sel.append('<option value="' + displayName + '">' + prefix + displayName + suffix + '</option>');
+        $sel.append(jQuery('<option></option>').val(options[j].name).text(prefix + options[j].name + suffix));
     }
 
     // 优先选当前ST预设，否则保持用户之前的选择
     if (currentSTPreset && !cur) {
-        $sel.val(escapeHTML(currentSTPreset));
+        $sel.val(currentSTPreset);
     } else if (cur && options.find(function (x) { return x.name === cur; })) {
         $sel.val(cur);
     } else if (currentSTPreset) {
-        $sel.val(escapeHTML(currentSTPreset));
+        $sel.val(currentSTPreset);
     }
 }
 
@@ -1163,6 +1217,8 @@ function manualSnapshotNow() {
         toastr.info('内容没有变化，跳过。');
     }
     jQuery('#ph_manual_label').val('');
+    // 手动备份针对的是当前真正生效的预设，完成后跳到它的历史，避免看着A却备份了B的错觉。
+    jQuery('#ph_filter_name').val(info.name);
     renderSnapshotList();
 }
 
@@ -1189,6 +1245,7 @@ jQuery(async function () {
     // 始终拦截以便缓存手动备份数据；开关只控制是否自动生成快照。
     installFetchInterceptor();
     installDirectPresetCapture();
-    console.log('[PresetHistory Test] v2.2.2 已加载');
-    toastr.success('预设历史测试版 v2.2.2 已加载', '🧪');
+    installPresetSwitchCapture();
+    console.log('[PresetHistory Test] v2.2.3 已加载');
+    toastr.success('预设历史测试版 v2.2.3 已加载', '🧪');
 });
