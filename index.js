@@ -1,5 +1,5 @@
 /**
- * SillyTavern-PresetHistory TauriTest v2.2.5
+ * SillyTavern-PresetHistory TauriTest v2.2.6
  *
  * 预设版本历史扩展 —— 自动 + 手动备份预设，一键回退
  * 监听当前预设状态与保存事件，按真实预设名保存快照。
@@ -298,10 +298,9 @@ function saveSnapshot(presetName, data, source, customLabel) {
         } else if (existing[0].hash === h || getPresetHash(existing[0].data) === h) {
             // 有备份，内容一样 → 跳过
             return null;
-        } else if (restoredToHash && restoredToHash === h) {
+        } else if (restoredToHash && samePresetName(presetName, restoreImportPresetName) && restoredToHash === h) {
             // 刚恢复到这个版本，跳过（不重复存恢复后的状态）
             console.log('[PresetHistory] 恢复后的保存，跳过');
-            restoredToHash = '';
             return null;
         } else {
             // 有备份，内容不同 → 存新版本
@@ -386,11 +385,116 @@ var fetchPatched = false;
 var originalFetch = null;
 var isRestoring = false;
 var restoredToHash = ''; // 刚恢复到的版本的hash，用于跳过恢复后的重复备份
+var restoreImportPresetName = '';
+var restoreImportCleanupTimer = null;
 var directCaptureInstalled = false;
 var presetSwitchCaptureInstalled = false;
 var settingsUpdatedCaptureInstalled = false;
 var settingsUpdatedCaptureTimer = null;
 var lastObservedPresetHashes = {};
+var pendingPresetImport = null;
+var pendingPresetImportTimer = null;
+
+function samePresetName(a, b) {
+    return String(a || '').trim() === String(b || '').trim();
+}
+
+function clearPendingPresetImport() {
+    if (pendingPresetImportTimer) clearTimeout(pendingPresetImportTimer);
+    if (pendingPresetImport && pendingPresetImport.isRestore) {
+        if (restoreImportCleanupTimer) clearTimeout(restoreImportCleanupTimer);
+        restoreImportCleanupTimer = null;
+        restoreImportPresetName = '';
+        restoredToHash = '';
+    }
+    pendingPresetImportTimer = null;
+    pendingPresetImport = null;
+}
+
+function schedulePendingPresetImportFallback(delay) {
+    if (pendingPresetImportTimer) clearTimeout(pendingPresetImportTimer);
+    pendingPresetImportTimer = setTimeout(function () {
+        if (!pendingPresetImport) return;
+
+        // 正常路径会等 SETTINGS_UPDATED；这里仅处理原生端没有发出该事件的情况。
+        if (pendingPresetImport.switched) {
+            var info = getLivePresetInfo() || pendingPresetImport.latestInfo;
+            if (info && samePresetName(info.name, pendingPresetImport.name)) {
+                finalizePendingPresetImport(info);
+                return;
+            }
+        }
+
+        console.warn('[PresetHistory] 导入未完成，已取消本次导入合并: ' + pendingPresetImport.name);
+        clearPendingPresetImport();
+    }, delay);
+}
+
+function beginPendingPresetImport(event) {
+    var name = event && typeof event.presetName === 'string' ? event.presetName.trim() : '';
+    if (!name) return;
+
+    var isRestoreImport = !!restoredToHash && samePresetName(name, restoreImportPresetName);
+    if (isRestoreImport) {
+        if (restoreImportCleanupTimer) clearTimeout(restoreImportCleanupTimer);
+        restoreImportCleanupTimer = null;
+    }
+
+    pendingPresetImport = {
+        name: name,
+        switched: false,
+        finalizing: false,
+        latestInfo: null,
+        isRestore: isRestoreImport,
+    };
+    // 导入失败时也不能一直拦着同名预设；成功后会在 PRESET_CHANGED 阶段重设此计时器。
+    schedulePendingPresetImportFallback(6000);
+    console.log('[PresetHistory] 正在合并导入过程: ' + name);
+}
+
+function holdPresetInfoDuringImport(info) {
+    if (!pendingPresetImport || pendingPresetImport.finalizing || !info) return false;
+    if (!samePresetName(info.name, pendingPresetImport.name)) return false;
+
+    pendingPresetImport.latestInfo = {
+        name: info.name,
+        data: deepClone(info.data),
+    };
+    return true;
+}
+
+function finalizePendingPresetImport(info) {
+    if (!pendingPresetImport || !pendingPresetImport.switched || !info) return false;
+    if (!samePresetName(info.name, pendingPresetImport.name)) return false;
+
+    var importedName = pendingPresetImport.name;
+    var isRestoreImport = pendingPresetImport.isRestore;
+    pendingPresetImport.finalizing = true;
+    if (pendingPresetImportTimer) clearTimeout(pendingPresetImportTimer);
+    pendingPresetImportTimer = null;
+
+    try {
+        // 只把 TauriTavern 完成迁移、补齐默认字段后的最终状态交给快照逻辑。
+        // 恢复旧快照时目标文件也会被新版补字段，因此把“恢复目标 hash”更新为最终标准形态。
+        if (isRestoreImport) restoredToHash = getPresetHash(info.data) || restoredToHash;
+        handlePresetInfo(info, { allowDuringImport: true });
+    } finally {
+        if (isRestoreImport) {
+            // 导入完成后还会有“自动保存预设”和设置保存等后续请求。
+            // 短时间保留恢复抑制，确保这些请求都不会把恢复目标重复拍成新版本。
+            if (restoreImportCleanupTimer) clearTimeout(restoreImportCleanupTimer);
+            restoreImportCleanupTimer = setTimeout(function () {
+                restoredToHash = '';
+                restoreImportPresetName = '';
+                restoreImportCleanupTimer = null;
+            }, 15000);
+        }
+        pendingPresetImport = null;
+    }
+
+    console.log('[PresetHistory] 导入已合并为一份最终备份: ' + importedName);
+    return true;
+}
 
 function isPresetSaveRequest(url, method) {
     if (method !== 'POST') return false;
@@ -425,11 +529,15 @@ async function readJsonRequestBody(input, init) {
     return null;
 }
 
-function handlePresetInfo(info) {
+function handlePresetInfo(info, options) {
     if (!info) return;
 
     // 即使关闭自动备份也缓存最新预设，保证“立即备份”仍然可用。
     rememberPresetInfo(info);
+
+    // 导入会先保存原始 JSON，再由 TauriTavern 迁移字段并补齐 Agent 标记。
+    // 两个阶段内容不同，但对用户来说是同一次导入，因此先按住，最终只保存稳定状态。
+    if (!(options && options.allowDuringImport) && holdPresetInfoDuringImport(info)) return;
 
     var settings = getSettings();
     if (!settings.autoSnapshot) return;
@@ -461,6 +569,17 @@ async function capturePresetSaveRequest(input, init) {
         var url = typeof input === 'string' ? input : (input && input.url ? input.url : '');
         var method = ((init && init.method) || (input && input.method) || 'GET').toUpperCase();
         if (!isPresetSaveRequest(url, method)) return;
+
+        // /api/settings/save 发送的是完整酒馆设置，其中 oai_settings 使用内部字段名；
+        // 若直接拿它和预设导出格式比较，会把同一状态误判成几十项变化。
+        // 此时统一从内存构建标准预设，只在旧版无法直读时才解析请求体兜底。
+        if (url.indexOf('/api/settings/save') !== -1) {
+            var liveInfo = getLivePresetInfo();
+            if (liveInfo) {
+                handlePresetInfo(liveInfo);
+                return;
+            }
+        }
 
         var parsed = await readJsonRequestBody(input, init);
         if (parsed) handlePresetSaveBody(parsed);
@@ -510,6 +629,11 @@ function installDirectPresetCapture() {
 function installPresetSwitchCapture() {
     if (presetSwitchCaptureInstalled || !eventSource || !event_types) return;
 
+    // 该事件发生在 /api/presets/save 之前，正好可以拦住导入原始 JSON 的那次早期抓取。
+    if (event_types.OAI_PRESET_IMPORT_READY) {
+        eventSource.on(event_types.OAI_PRESET_IMPORT_READY, beginPendingPresetImport);
+    }
+
     // 切走之前先保存旧预设。此时事件里的 settings 仍是旧预设内容，
     // presetNameBefore 则是它的真实名字，不会发生“新名字 + 旧内容”的串档。
     if (event_types.OAI_PRESET_CHANGED_BEFORE) {
@@ -517,7 +641,8 @@ function installPresetSwitchCapture() {
             if (isRestoring || !event) return;
             var oldName = typeof event.presetNameBefore === 'string' ? event.presetNameBefore.trim() : '';
             var oldData = buildPresetData(event.settings);
-            if (oldName && oldData) handlePresetInfo({ name: oldName, data: oldData });
+            // 覆盖一个与当前预设同名的导入时，旧状态仍应先保留下来。
+            if (oldName && oldData) handlePresetInfo({ name: oldName, data: oldData }, { allowDuringImport: true });
         });
     }
 
@@ -529,6 +654,13 @@ function installPresetSwitchCapture() {
                 var info = getLivePresetInfo();
                 if (!info) return;
                 if (typeof event.name === 'string' && event.name.trim()) info.name = event.name.trim();
+
+                if (pendingPresetImport && samePresetName(info.name, pendingPresetImport.name)) {
+                    pendingPresetImport.switched = true;
+                    // 正常会在约 1 秒后的 SETTINGS_UPDATED 完成；2.5 秒只是保险兜底。
+                    schedulePendingPresetImportFallback(2500);
+                }
+
                 handlePresetInfo(info);
                 jQuery('#ph_filter_name').val('');
                 renderSnapshotList();
@@ -556,6 +688,12 @@ function installSettingsUpdatedCapture() {
             var previousHash = lastObservedPresetHashes[info.name];
             var contentChanged = !previousHash || previousHash !== currentHash;
             lastObservedPresetHashes[info.name] = currentHash;
+
+            if (pendingPresetImport && pendingPresetImport.switched && samePresetName(info.name, pendingPresetImport.name)) {
+                pendingPresetImport.latestInfo = { name: info.name, data: deepClone(info.data) };
+                if (finalizePendingPresetImport(info) && getSettings().autoSavePreset) triggerPresetSave();
+                return;
+            }
 
             handlePresetInfo(info);
             if (contentChanged && getSettings().autoSavePreset) triggerPresetSave();
@@ -598,6 +736,18 @@ function diffPresets(oldData, newData, mode) {
     var newContentMap = {};
     for (var j = 0; j < newPrompts.length; j++) {
         newContentMap[newPrompts[j].identifier] = newPrompts[j];
+    }
+
+    // TauriTavern 2.2 会为旧预设自动补齐这些 Agent 位置标记。
+    // 它们是系统管理的空占位符，不属于用户改动，也不应污染恢复差异。
+    var managedPromptIdentifiers = {
+        agentSystemPrompt: true,
+        agentTask: true,
+        agentResults: true,
+    };
+
+    function isManagedPrompt(identifier) {
+        return !!managedPromptIdentifiers[identifier];
     }
 
     // 从 prompt_order 里提取开关状态和顺序
@@ -646,6 +796,7 @@ function diffPresets(oldData, newData, mode) {
     // 新增的条目：区分"创建"和"绑定"
     // prompts里新增但order里没有 = 创建了条目（还没绑定）
     for (var pk in newContentMap) {
+        if (isManagedPrompt(pk)) continue;
         if (!oldContentMap[pk] && newEnabledMap[pk] === undefined) {
             if (mode === 'changelog') {
                 diffs.push('创建了条目「' + getName(pk) + '」');
@@ -657,6 +808,7 @@ function diffPresets(oldData, newData, mode) {
 
     // order里新增 = 绑定到预设
     for (var nk in newEnabledMap) {
+        if (isManagedPrompt(nk)) continue;
         if (oldEnabledMap[nk] === undefined) {
             var isAlsoNewInPrompts = !oldContentMap[nk];
             if (mode === 'changelog') {
@@ -669,6 +821,7 @@ function diffPresets(oldData, newData, mode) {
 
     // 从order移除（条目还在prompts里，可以绑回来）
     for (var ok in oldEnabledMap) {
+        if (isManagedPrompt(ok)) continue;
         if (newEnabledMap[ok] === undefined) {
             if (newContentMap[ok]) {
                 // 还在prompts里 = 只是从预设移除
@@ -684,6 +837,7 @@ function diffPresets(oldData, newData, mode) {
 
     // 从prompts里彻底删除
     for (var dk in oldContentMap) {
+        if (isManagedPrompt(dk)) continue;
         if (!newContentMap[dk]) {
             if (mode === 'changelog') {
                 diffs.push('彻底删除了「' + (oldContentMap[dk].name || '未命名') + '」');
@@ -695,6 +849,7 @@ function diffPresets(oldData, newData, mode) {
 
     // 开关变化
     for (var ek in oldEnabledMap) {
+        if (isManagedPrompt(ek)) continue;
         if (newEnabledMap[ek] !== undefined && oldEnabledMap[ek] !== newEnabledMap[ek]) {
             if (mode === 'changelog') {
                 diffs.push((newEnabledMap[ek] ? '开启' : '关闭') + '了「' + getName(ek) + '」');
@@ -706,6 +861,7 @@ function diffPresets(oldData, newData, mode) {
 
     // 条目属性修改
     for (var mk in oldContentMap) {
+        if (isManagedPrompt(mk)) continue;
         if (newContentMap[mk]) {
             var op = oldContentMap[mk];
             var np = newContentMap[mk];
@@ -787,7 +943,13 @@ function diffPresets(oldData, newData, mode) {
     }
 
     // 其余预设字段也参与提示，避免新版增加字段后只备份却说不出改了什么。
-    var ignoredKeys = { prompts: true, prompt_order: true, preset_settings_openai: true };
+    var ignoredKeys = {
+        prompts: true,
+        prompt_order: true,
+        preset_settings_openai: true,
+        // 这是内部结构版本号，不是用户设置。
+        additional_parameters_migration_version: true,
+    };
     for (var ig = 0; ig < settingFields.length; ig++) {
         for (var ik = 0; ik < settingFields[ig].keys.length; ik++) ignoredKeys[settingFields[ig].keys[ik]] = true;
     }
@@ -810,6 +972,8 @@ function diffPresets(oldData, newData, mode) {
         reasoning_effort: '推理强度',
         verbosity: '详细程度',
         seed: 'Seed',
+        additional_parameters_by_source: '附加参数',
+        custom_models_by_source: '自定义模型列表',
     };
     var allOtherKeys = {};
     Object.keys(oldData).forEach(function (key) { allOtherKeys[key] = true; });
@@ -817,6 +981,9 @@ function diffPresets(oldData, newData, mode) {
     var otherChanges = [];
     Object.keys(allOtherKeys).sort().forEach(function (key) {
         if (ignoredKeys[key]) return;
+        // 导入旧预设时新版会批量补齐几十个默认字段。单边不存在只代表结构升级，
+        // 不是用户改动；真正的设置变化会在两个稳定快照都含有该字段时被比较出来。
+        if (!Object.prototype.hasOwnProperty.call(oldData, key) || !Object.prototype.hasOwnProperty.call(newData, key)) return;
         if (stableStringify(oldData[key]) !== stableStringify(newData[key])) {
             otherChanges.push(friendlyNames[key] || key.replace(/_/g, ' '));
         }
@@ -885,6 +1052,14 @@ async function restoreSnapshot(presetName, snap) {
 
         // 记录恢复目标的hash，恢复后的自动保存如果匹配就跳过
         restoredToHash = getPresetHash(snap.data) || snap.hash || '';
+        restoreImportPresetName = presetName;
+        if (restoreImportCleanupTimer) clearTimeout(restoreImportCleanupTimer);
+        // 用户若在酒馆的覆盖确认框里取消，避免恢复标记永久残留。
+        restoreImportCleanupTimer = setTimeout(function () {
+            restoreImportPresetName = '';
+            restoredToHash = '';
+            restoreImportCleanupTimer = null;
+        }, 120000);
 
         // 触发change事件，让ST的导入逻辑接管
         $fileInput[0].dispatchEvent(new Event('input', { bubbles: true }));
@@ -1307,6 +1482,11 @@ function manualSnapshotNow() {
         return;
     }
 
+    if (pendingPresetImport && !pendingPresetImport.finalizing && samePresetName(info.name, pendingPresetImport.name)) {
+        toastr.info('新预设还在整理兼容字段，请稍等一两秒再备份。');
+        return;
+    }
+
     var snapshotLabel = customLabel;
     if (!snapshotLabel) {
         var existingSnaps = getSnapshots(info.name);
@@ -1357,6 +1537,6 @@ jQuery(async function () {
     installPresetSwitchCapture();
     installSettingsUpdatedCapture();
     installPromptToggleCapture();
-    console.log('[PresetHistory Test] v2.2.5 已加载');
-    toastr.success('预设历史测试版 v2.2.5 已加载', '🧪');
+    console.log('[PresetHistory Test] v2.2.6 已加载');
+    toastr.success('预设历史测试版 v2.2.6 已加载', '🧪');
 });
